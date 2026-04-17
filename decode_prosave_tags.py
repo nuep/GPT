@@ -53,6 +53,7 @@ COUNTER_TIMER_PATTERN = re.compile(
 )
 
 KNOWN_PREFIXES = ("DB", "I", "Q", "M", "T", "C")
+COMMON_BACKUP_EXTENSIONS = (".psb", ".fwd", ".bak", ".bin", ".zip", ".tar", ".gz", ".tgz")
 
 
 def normalize_tag(tag: str) -> str:
@@ -168,23 +169,79 @@ def write_json(hits: list[TagHit], path: Path) -> None:
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def resolve_input_files(input_path: Path, recursive: bool = False) -> list[Path]:
+    """
+    Rozwiązuje wejście:
+    - plik => [plik]
+    - katalog => lista potencjalnych backupów
+    """
+    if input_path.is_file():
+        return [input_path]
+
+    if input_path.is_dir():
+        pattern = "**/*" if recursive else "*"
+        candidates: list[Path] = []
+        for p in input_path.glob(pattern):
+            if not p.is_file():
+                continue
+            if p.suffix.lower() in COMMON_BACKUP_EXTENSIONS:
+                candidates.append(p)
+        return sorted(candidates)
+
+    return []
+
+
+def print_path_help(input_path: Path) -> None:
+    print(f"[ERR] Nie znaleziono pliku/katalogu: {input_path}", file=sys.stderr)
+    print(
+        "[TIP] Jeśli ścieżka ma spacje, podaj ją w cudzysłowie, np.: "
+        'python3 decode_prosave_tags.py "C:\\Moje backupy\\Panel OP17.psb"',
+        file=sys.stderr,
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Dekoduje backup ProSave i wyciąga adresację tagów Siemens."
     )
-    parser.add_argument("backup", type=Path, help="Ścieżka do pliku backupu ProSave.")
+    parser.add_argument(
+        "backup",
+        type=Path,
+        help="Ścieżka do pliku backupu ProSave lub katalogu z backupami.",
+    )
     parser.add_argument("--json", dest="json_out", type=Path, help="Zapisz wynik do JSON.")
     parser.add_argument("--csv", dest="csv_out", type=Path, help="Zapisz wynik do CSV.")
+    parser.add_argument(
+        "-r",
+        "--recursive",
+        action="store_true",
+        help="Przy wejściu będącym katalogiem skanuj rekurencyjnie podkatalogi.",
+    )
     args = parser.parse_args()
 
     if not args.backup.exists():
-        print(f"[ERR] Brak pliku: {args.backup}", file=sys.stderr)
+        print_path_help(args.backup)
         return 2
 
-    payloads = sniff_and_collect_payloads(args.backup)
+    input_files = resolve_input_files(args.backup, recursive=args.recursive)
+    if not input_files:
+        if args.backup.is_dir():
+            print(
+                f"[ERR] W katalogu nie znaleziono backupów z rozszerzeniami: "
+                f"{', '.join(COMMON_BACKUP_EXTENSIONS)}",
+                file=sys.stderr,
+            )
+        else:
+            print_path_help(args.backup)
+        return 2
+
     all_hits: list[TagHit] = []
-    for name, data in payloads:
-        all_hits.extend(extract_tags_from_payload(name, data))
+    processed_files: list[str] = []
+    for backup_file in input_files:
+        payloads = sniff_and_collect_payloads(backup_file)
+        for name, data in payloads:
+            all_hits.extend(extract_tags_from_payload(name, data))
+        processed_files.append(str(backup_file))
 
     hits = dedupe_hits(all_hits)
 
@@ -194,7 +251,10 @@ def main() -> int:
         write_csv(hits, args.csv_out)
 
     # stdout summary
-    print(f"Plik: {args.backup}")
+    if len(processed_files) == 1:
+        print(f"Plik: {processed_files[0]}")
+    else:
+        print(f"Przetworzone pliki: {len(processed_files)}")
     print(f"Znaleziono tagów: {len(hits)}")
     for h in hits:
         print(f"- {h.tag} [{h.source_file}/{h.encoding}]")
